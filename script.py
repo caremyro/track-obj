@@ -1,9 +1,8 @@
-import tkinter as tk #make the app 
-import threading #don't block the app when analysing 
-import cv2 #recover the video flow 
-from PIL import Image, ImageTk #convert cv -> tkinter
-from ultralytics import YOLO #vision model 
-import queue
+import tkinter as tk
+import threading
+import cv2
+from PIL import Image, ImageTk
+from ultralytics import YOLO
 import time
 
 model = YOLO("yolov8n.pt")
@@ -13,50 +12,62 @@ class VideoApp:
         self.root = root
         self.root.title("Flux Vidéo Live")
         self.stream_url = stream_url
-        self.cap = cv2.VideoCapture(self.stream_url)
         
-        # Vérifier si le flux vidéo est ouvert correctement
-        if not self.cap.isOpened():
-            print(f"Erreur: Impossible d'ouvrir le flux vidéo à l'URL: {stream_url}")
-            self.root.destroy()
-            return
-            
-        # Configuration de la capture vidéo pour de meilleures performances
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Réduire la taille du buffer
-        
-        self.rotation_angle = 0  
-        self.label = tk.Label(root)
-        self.label.pack(expand=True, fill=tk.BOTH)
-        
-        self.rotate_left_btn = tk.Button(root, text="Rotation -90°", command=self.rotate_left)
-        self.rotate_left_btn.pack(side=tk.LEFT, padx=10, pady=5)
-        self.rotate_right_btn = tk.Button(root, text="Rotation +90°", command=self.rotate_right)
-        self.rotate_right_btn.pack(side=tk.LEFT, padx=10, pady=5)
-        
-        # Variables pour le multithreading
+        # Variables essentielles uniquement
         self.running = True
-        self.frame_queue = queue.Queue(maxsize=2)  # Limiter la taille de la file d'attente
-        self.imgtk = None
+        self.frame = None
+        self.frame_lock = threading.Lock()
+        self.processed_frame = None
+        self.processed_frame_lock = threading.Lock()
+        self.rotation_angle = 0
+        self.last_process_time = 0
+        self.process_interval = 0.3
+        self.skip_frames = 4
+        self.frame_count = 0
+        self.target_fps = 15
+        self.last_frame_time = 0
         
-        # Démarrer les threads
+        # Interface simplifiée
+        self.setup_ui()
+        
+        # Capture vidéo
+        self.cap = cv2.VideoCapture(self.stream_url)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 480)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+        
+        # Threads
         self.capture_thread = threading.Thread(target=self.capture_frames)
         self.capture_thread.daemon = True
         self.capture_thread.start()
         
-        self.processing_thread = threading.Thread(target=self.process_frames)
-        self.processing_thread.daemon = True
-        self.processing_thread.start()
+        self.process_thread = threading.Thread(target=self.process_frames)
+        self.process_thread.daemon = True
+        self.process_thread.start()
         
-        # Démarrer la mise à jour de l'interface
         self.update_display()
-
+    
+    def setup_ui(self):
+        self.main_frame = tk.Frame(self.root)
+        self.main_frame.pack(expand=True, fill=tk.BOTH)
+        
+        self.label = tk.Label(self.main_frame)
+        self.label.pack(expand=True, fill=tk.BOTH)
+        
+        self.button_frame = tk.Frame(self.main_frame)
+        self.button_frame.pack(fill=tk.X, pady=5)
+        
+        self.rotate_left_btn = tk.Button(self.button_frame, text="Rotation -90°", command=self.rotate_left)
+        self.rotate_left_btn.pack(side=tk.LEFT, padx=10, pady=5)
+        
+        self.rotate_right_btn = tk.Button(self.button_frame, text="Rotation +90°", command=self.rotate_right)
+        self.rotate_right_btn.pack(side=tk.LEFT, padx=10, pady=5)
+    
     def rotate_left(self):
         self.rotation_angle = (self.rotation_angle - 90) % 360
-        print(f"Rotation actuelle : {self.rotation_angle}°")
 
     def rotate_right(self):
         self.rotation_angle = (self.rotation_angle + 90) % 360
-        print(f"Rotation actuelle : {self.rotation_angle}°")
 
     def rotate_frame(self, frame):
         if self.rotation_angle == 90:
@@ -68,88 +79,94 @@ class VideoApp:
         return frame
 
     def capture_frames(self):
-        """Thread pour capturer les frames vidéo"""
         while self.running:
-            ret, frame = self.cap.read()
-            if not ret:
-                print("Erreur de lecture du flux vidéo.")
-                time.sleep(0.1)  # Attendre un peu avant de réessayer
+            current_time = time.time()
+            if current_time - self.last_frame_time < 1.0 / self.target_fps:
+                time.sleep(0.001)
                 continue
-                
-            # Appliquer la rotation
-            frame = self.rotate_frame(frame)
-            
-            # Mettre la frame dans la file d'attente, en supprimant l'ancienne si nécessaire
-            try:
-                if self.frame_queue.full():
-                    self.frame_queue.get_nowait()  # Supprimer l'ancienne frame
-                self.frame_queue.put_nowait(frame)
-            except queue.Full:
-                pass  # Ignorer si la file est pleine
-                
-            # Limiter la fréquence de capture
-            time.sleep(0.01)  # 10ms de délai entre les captures
+
+            ret, frame = self.cap.read()
+            if ret and frame is not None:
+                frame = self.rotate_frame(frame)
+                with self.frame_lock:
+                    self.frame = frame
+                self.last_frame_time = current_time
+                time.sleep(0.01)
 
     def process_frames(self):
-        """Thread pour traiter les frames avec YOLO"""
         while self.running:
-            try:
-                # Récupérer une frame de la file d'attente
-                frame = self.frame_queue.get(timeout=0.1)
-                
-                # Redimensionner l'image pour accélérer le traitement
-                height, width = frame.shape[:2]
-                if width > 640:  # Limiter la taille maximale
-                    scale = 640 / width
-                    frame = cv2.resize(frame, None, fx=scale, fy=scale)
-                
-                # Utilisation de YOLO pour la détection d'objets
-                results = model(frame, verbose=False)  # Désactiver les messages de progression
-                
-                # Dessiner les boîtes autour des objets détectés
-                for result in results[0].boxes:
-                    x1, y1, x2, y2 = result.xyxy[0]
-                    conf = result.conf[0]
-                    cls = result.cls[0]
+            self.frame_count += 1
+            if self.frame_count % self.skip_frames != 0:
+                time.sleep(0.01)
+                continue
+            
+            current_time = time.time()
+            if current_time - self.last_process_time < self.process_interval:
+                time.sleep(0.01)
+                continue
+            
+            with self.frame_lock:
+                if self.frame is None:
+                    continue
+                frame = self.frame.copy()
+            
+            height, width = frame.shape[:2]
+            if width > 480:
+                scale = 480 / width
+                frame = cv2.resize(frame, None, fx=scale, fy=scale)
+            
+            results = model(frame, verbose=False, conf=0.4)
+            
+            for result in results:
+                boxes = result.boxes
+                for box in boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                    conf = box.conf[0].cpu().numpy()
+                    cls = int(box.cls[0].cpu().numpy())
                     
-                    if conf > 0.5:
-                        x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        cv2.putText(frame, f'{model.names[int(cls)]} {conf:.2f}', 
-                                  (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                
-                # Convertir l'image pour l'affichage
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                img = Image.fromarray(frame)
-                self.imgtk = ImageTk.PhotoImage(image=img)
-                
-            except queue.Empty:
-                pass  # Ignorer si la file est vide
-            except Exception as e:
-                print(f"Erreur lors du traitement: {e}")
-                time.sleep(0.1)
+                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+                    label = f"{model.names[cls]} {conf:.2f}"
+                    cv2.putText(frame, label, (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            
+            with self.processed_frame_lock:
+                self.processed_frame = frame
+            
+            self.last_process_time = current_time
 
     def update_display(self):
-        """Mettre à jour l'affichage de l'interface"""
-        if self.running and self.imgtk:
-            self.label.config(image=self.imgtk)
-        self.root.after(50, self.update_display)  # Mise à jour toutes les 50ms
+        if self.running:
+            display_frame = None
+            with self.processed_frame_lock:
+                if self.processed_frame is not None:
+                    display_frame = self.processed_frame.copy()
+            
+            if display_frame is None:
+                with self.frame_lock:
+                    if self.frame is not None:
+                        display_frame = self.frame.copy()
+            
+            if display_frame is not None:
+                frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(frame_rgb)
+                imgtk = ImageTk.PhotoImage(image=img)
+                self.label.config(image=imgtk)
+                self.label.image = imgtk
+        
+        self.root.after(50, self.update_display)
+
+    def cleanup(self):
+        self.running = False
+        if hasattr(self, 'cap'):
+            self.cap.release()
 
     def stop(self):
-        self.running = False
-        if self.cap.isOpened():
-            self.cap.release()
-        # Attendre que les threads se terminent
-        if hasattr(self, 'capture_thread'):
-            self.capture_thread.join(timeout=1.0)
-        if hasattr(self, 'processing_thread'):
-            self.processing_thread.join(timeout=1.0)
+        self.cleanup()
+        self.root.quit()
+        self.root.destroy()
 
 def start_video_app():
     url = url_entry.get()
     if not url.startswith("http"):
-        url_entry.delete(0, tk.END)
-        url_entry.insert(0, "URL invalide")
         return
 
     entry_window.destroy()
@@ -164,7 +181,7 @@ entry_window.title("Connexion au flux vidéo")
 tk.Label(entry_window, text="Entrez l'URL du flux vidéo :").pack(pady=5)
 url_entry = tk.Entry(entry_window, width=40)
 url_entry.pack(padx=10, pady=5)
-url_entry.insert(0, "http://192.168.X.X:4747/video")
+url_entry.insert(0, "http://192.168.1.70:4747/video")
 
 tk.Button(entry_window, text="Afficher le flux", command=start_video_app).pack(pady=10)
 
